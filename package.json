@@ -10,12 +10,14 @@
   },
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
+    "@vercel/kv": "^3.0.0",
     "next": "15.5.4",
     "pdfjs": "^2.5.4",
     "pdfjs-dist": "^5.4.149",
     "react": "19.1.0",
     "react-dom": "19.1.0",
-    "recharts": "^3.2.1"
+    "recharts": "^3.2.1",
+    "redis": "^5.8.3"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3",

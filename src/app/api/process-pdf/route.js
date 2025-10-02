@@ -59,7 +59,7 @@ export async function POST(request) {
       Para as linhas que representam a Dimensão em si, os campos "item_code", "item_text" e "item_score" devem ser 'null'.
     `;
 
-    // --- Início da Lógica de Retentativa (Retry) Adicionada ---
+    // --- Início da Lógica de Retentativa (Retry) ---
 
     const maxRetries = 3; // Tenta no máximo 3 vezes
     let delay = 2000; // Começa com um atraso de 2 segundos
@@ -72,8 +72,17 @@ export async function POST(request) {
         const response = await result.response;
         const text = response.text();
 
-        // Limpa e retorna a resposta JSON
-        const cleanedText = text.replace(/```json/g, "").replace(/```/g, "").trim();
+        // --- CORREÇÃO DE SINTAXE AQUI ---
+        // Reescrevemos a limpeza do texto para evitar erros de parsing da expressão regular.
+        let cleanedText = text.trim();
+        if (cleanedText.startsWith("```json")) {
+          cleanedText = cleanedText.substring(7);
+        }
+        if (cleanedText.endsWith("```")) {
+          cleanedText = cleanedText.substring(0, cleanedText.length - 3);
+        }
+        // --- FIM DA CORREÇÃO ---
+
         const data = JSON.parse(cleanedText);
 
         // Se a chamada foi bem-sucedida, retorna o resultado e sai da função

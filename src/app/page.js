@@ -2,7 +2,7 @@
 
 "use client";
 import "./globals.css";
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback } from "react";
 import PdfSelector from "@/components/PdfSelector";
 import Filters from "@/components/Filters";
 import { DimensionsBar, ItemsBar } from "@/components/Charts";
@@ -14,29 +14,14 @@ export default function HomePage() {
   const [error, setError] = useState("");
   const [selectedDim, setSelectedDim] = useState(null);
   const [q, setQ] = useState("");
-
-  // Efeito para carregar dados do cache na inicialização
-  useEffect(() => {
-    try {
-      const cachedData = localStorage.getItem('cachedPdfData');
-      if (cachedData) {
-        console.log("Dados encontrados no cache, carregando...");
-        setRows(JSON.parse(cachedData));
-      }
-    } catch (e) {
-      console.error("Falha ao ler o cache:", e);
-      localStorage.removeItem('cachedPdfData');
-    }
-  }, []);
+  const [fromCache, setFromCache] = useState(false); // Estado para rastrear se os dados vieram do cache
 
   const handleFileSelected = useCallback(async (file) => {
     if (!file) return;
 
     setLoading(true);
     setError("");
-    setRows([]);
-    setSelectedDim(null);
-    setQ("");
+    setFromCache(false); // Reseta o status do cache para cada novo envio
     
     try {
       const formData = new FormData();
@@ -53,11 +38,9 @@ export default function HomePage() {
         throw new Error(result.error || "Erro desconhecido do servidor.");
       }
 
-      console.log("Análise da IA concluída. Dados encontrados:", result.rows);
+      console.log("Análise concluída. Dados encontrados:", result.rows);
       setRows(result.rows);
-      
-      // Salva os dados no cache após o sucesso
-      localStorage.setItem('cachedPdfData', JSON.stringify(result.rows));
+      setFromCache(result.fromCache || false); // Atualiza o status do cache com base na resposta da API
 
       if (result.rows.length === 0) {
         setError("A IA não conseguiu extrair dados estruturados do PDF.");
@@ -71,16 +54,17 @@ export default function HomePage() {
     }
   }, []);
 
-  // Função para limpar os dados e o cache
-  const handleClearData = () => {
-    localStorage.removeItem('cachedPdfData');
+  // Função para limpar a tela e permitir uma nova análise
+  const handleStartNew = () => {
     setRows([]);
     setError("");
     setSelectedDim(null);
     setQ("");
-    console.log("Cache e dados limpos.");
+    setFromCache(false);
+    console.log("Dados da tela limpos para nova análise.");
   };
 
+  // Tela inicial quando não há dados carregados
   if (rows.length === 0) {
     return (
       <div className="container">
@@ -101,11 +85,20 @@ export default function HomePage() {
     );
   }
 
+  // Tela principal com os dados e gráficos
   return (
     <div className="container">
       <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
         <h1>Relatório de Dimensões</h1>
-        <button onClick={handleClearData} style={{height: '40px'}}>Analisar Novo PDF</button>
+        <div>
+          {/* Mostra a etiqueta de cache se os dados vieram de lá */}
+          {fromCache && (
+            <span style={{marginRight: '15px', background: '#e0f2fe', color: '#0ea5e9', padding: '5px 10px', borderRadius: '15px', fontSize: '12px', fontWeight: 'bold'}}>
+              Cache
+            </span>
+          )}
+          <button onClick={handleStartNew} style={{height: '40px'}}>Analisar Novo PDF</button>
+        </div>
       </div>
       
       <div className="row">
