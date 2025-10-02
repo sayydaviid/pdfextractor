@@ -1,0 +1,27 @@
+/* src/components/DataTable.module.css */
+.tableContainer {
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.dataTable {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.dataTable th,
+.dataTable td {
+  padding: 8px 12px;
+  border: 1px solid #ddd;
+  text-align: left;
+}
+
+.dataTable th {
+  background-color: #f2f2f2;
+  position: sticky;
+  top: 0;
+}
+
+.dataTable tbody tr:nth-child(even) {
+  background-color: #f9f9f9;
+}
