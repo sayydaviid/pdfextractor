@@ -2,6 +2,8 @@
 
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { NextResponse } from "next/server";
+import { kv } from "@vercel/kv";
+import { createHash } from "crypto";
 
 // Função para converter o stream do arquivo em um buffer
 async function streamToBuffer(stream) {
@@ -22,8 +24,24 @@ export async function POST(request) {
       return NextResponse.json({ error: "Nenhum arquivo enviado." }, { status: 400 });
     }
 
-    // 2. Converte o arquivo para o formato que a API do Gemini entende
     const buffer = await streamToBuffer(file.stream());
+
+    // --- LÓGICA DE CACHE ADICIONADA ---
+    // Calcula um hash único para o conteúdo do arquivo
+    const fileHash = createHash('sha256').update(buffer).digest('hex');
+    console.log(`Hash do arquivo: ${fileHash}`);
+
+    // Verifica se o resultado já existe no Vercel KV
+    const cachedResult = await kv.get(fileHash);
+    if (cachedResult) {
+      console.log("CACHE HIT! Retornando dados salvos.");
+      return NextResponse.json({ rows: cachedResult, fromCache: true, hash: fileHash, fileName: file.name });
+    }
+    console.log("CACHE MISS! Chamando a API do Gemini.");
+    // --- FIM DA LÓGICA DE CACHE ---
+
+
+    // Converte o arquivo para o formato que a API do Gemini entende
     const filePart = {
       inlineData: {
         data: buffer.toString("base64"),
@@ -33,7 +51,7 @@ export async function POST(request) {
 
     const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
     
-    // Corrigido para o nome de modelo válido e mais poderoso
+    // Corrigido para o nome de modelo válido e mais poderoso que sabemos que funciona
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
 
     const prompt = `
@@ -59,21 +77,17 @@ export async function POST(request) {
       Para as linhas que representam a Dimensão em si, os campos "item_code", "item_text" e "item_score" devem ser 'null'.
     `;
 
-    // --- Início da Lógica de Retentativa (Retry) ---
-
-    const maxRetries = 3; // Tenta no máximo 3 vezes
-    let delay = 2000; // Começa com um atraso de 2 segundos
+    // --- Início da Lógica de Retentativa (Retry) Adicionada ---
+    const maxRetries = 3;
+    let delay = 2000;
 
     for (let i = 0; i < maxRetries; i++) {
       try {
         console.log(`Tentativa ${i + 1} de chamar a API do Gemini...`);
-        // Envia o prompt e o arquivo para o modelo
         const result = await model.generateContent([prompt, filePart]);
         const response = await result.response;
         const text = response.text();
 
-        // --- CORREÇÃO DE SINTAXE AQUI ---
-        // Reescrevemos a limpeza do texto para evitar erros de parsing da expressão regular.
         let cleanedText = text.trim();
         if (cleanedText.startsWith("```json")) {
           cleanedText = cleanedText.substring(7);
@@ -81,24 +95,23 @@ export async function POST(request) {
         if (cleanedText.endsWith("```")) {
           cleanedText = cleanedText.substring(0, cleanedText.length - 3);
         }
-        // --- FIM DA CORREÇÃO ---
 
         const data = JSON.parse(cleanedText);
+        
+        // --- ADICIONADO: Salvando o novo resultado no cache ---
+        const twoDaysInSeconds = 2 * 24 * 60 * 60;
+        await kv.set(fileHash, data, { ex: twoDaysInSeconds });
+        console.log(`Resultado salvo no cache por 2 dias. Chave: ${fileHash}`);
 
-        // Se a chamada foi bem-sucedida, retorna o resultado e sai da função
         console.log("Sucesso na chamada da API!");
-        return NextResponse.json({ rows: data });
+        return NextResponse.json({ rows: data, fromCache: false, hash: fileHash, fileName: file.name });
       
       } catch (error) {
-        // Verifica se o erro é o 503 (sobrecarregado) e se ainda não é a última tentativa
         if (error.status === 503 && i < maxRetries - 1) {
           console.warn(`API sobrecarregada (503). Tentativa ${i + 1} falhou. Tentando novamente em ${delay / 1000}s...`);
-          // Espera o tempo de delay
           await new Promise(resolve => setTimeout(resolve, delay));
-          // Aumenta o delay para a próxima tentativa (backoff exponencial)
           delay *= 2; 
         } else {
-          // Se for outro erro ou a última tentativa, joga o erro para ser pego pelo catch principal
           throw error;
         }
       }
@@ -107,7 +120,6 @@ export async function POST(request) {
 
   } catch (error) {
     console.error("Erro na API Route do Gemini após todas as tentativas:", error);
-    // Retorna uma mensagem de erro mais específica para o frontend
     const errorMessage = error.status === 503 
       ? "A API do Google está sobrecarregada no momento. Por favor, tente novamente mais tarde."
       : "Falha ao processar o PDF com a IA.";

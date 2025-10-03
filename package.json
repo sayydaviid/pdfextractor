@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
+    "@vercel/blob": "^2.0.0",
     "@vercel/kv": "^3.0.0",
     "next": "15.5.4",
     "pdfjs": "^2.5.4",

@@ -2,8 +2,9 @@
 
 "use client";
 import "./globals.css";
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import PdfSelector from "@/components/PdfSelector";
+import RecentFiles from "@/components/RecentFiles"; // Importa o novo componente
 import Filters from "@/components/Filters";
 import { DimensionsBar, ItemsBar } from "@/components/Charts";
 import DataTable from "@/components/DataTable";
@@ -14,14 +15,59 @@ export default function HomePage() {
   const [error, setError] = useState("");
   const [selectedDim, setSelectedDim] = useState(null);
   const [q, setQ] = useState("");
-  const [fromCache, setFromCache] = useState(false); // Estado para rastrear se os dados vieram do cache
+  const [fromCache, setFromCache] = useState(false);
+  const [recentFiles, setRecentFiles] = useState([]); // Novo estado para arquivos recentes
 
+  // Efeito para carregar a lista de arquivos recentes do localStorage na inicialização
+  useEffect(() => {
+    try {
+      const cachedFiles = localStorage.getItem('recentPdfs');
+      if (cachedFiles) {
+        setRecentFiles(JSON.parse(cachedFiles));
+      }
+    } catch (e) {
+      console.error("Falha ao ler a lista de arquivos recentes:", e);
+      localStorage.removeItem('recentPdfs');
+    }
+  }, []);
+
+  // Função para salvar um arquivo na lista de recentes (no estado e no localStorage)
+  const saveRecentFile = (fileName, hash) => {
+    const newFile = { fileName, hash, timestamp: new Date().toISOString() };
+    
+    // Atualiza a lista, evitando duplicados e mantendo os 5 mais recentes
+    setRecentFiles(currentFiles => {
+      const updatedFiles = [newFile, ...currentFiles.filter(f => f.hash !== hash)].slice(0, 5);
+      localStorage.setItem('recentPdfs', JSON.stringify(updatedFiles));
+      return updatedFiles;
+    });
+  };
+
+  // Função central para processar a resposta da API
+  const processApiResponse = (result) => {
+    if (!result.rows) {
+      throw new Error("Resposta da API em formato inesperado.");
+    }
+    console.log("Análise concluída. Dados encontrados:", result.rows);
+    setRows(result.rows);
+    setFromCache(result.fromCache || false);
+
+    if (result.hash && result.fileName) {
+      saveRecentFile(result.fileName, result.hash);
+    }
+
+    if (result.rows.length === 0) {
+      setError("A IA não conseguiu extrair dados estruturados do PDF.");
+    }
+  };
+
+  // Lida com o envio de um NOVO arquivo
   const handleFileSelected = useCallback(async (file) => {
     if (!file) return;
 
     setLoading(true);
     setError("");
-    setFromCache(false); // Reseta o status do cache para cada novo envio
+    setFromCache(false);
     
     try {
       const formData = new FormData();
@@ -33,21 +79,41 @@ export default function HomePage() {
       });
 
       const result = await response.json();
-
-      if (!response.ok) {
-        throw new Error(result.error || "Erro desconhecido do servidor.");
-      }
-
-      console.log("Análise concluída. Dados encontrados:", result.rows);
-      setRows(result.rows);
-      setFromCache(result.fromCache || false); // Atualiza o status do cache com base na resposta da API
-
-      if (result.rows.length === 0) {
-        setError("A IA não conseguiu extrair dados estruturados do PDF.");
-      }
+      if (!response.ok) throw new Error(result.error || "Erro desconhecido do servidor.");
+      
+      processApiResponse(result);
 
     } catch (err) {
       console.error("Falha ao enviar PDF para a API:", err);
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }, []); // Dependências vazias para evitar recriação desnecessária
+
+  // Lida com o clique em um arquivo RECENTE
+  const handleRecentFileClick = useCallback(async (hash, fileName) => {
+    setLoading(true);
+    setError("");
+    setFromCache(false);
+
+    try {
+      const formData = new FormData();
+      formData.append("hash", hash);
+      formData.append("fileName", fileName);
+
+      const response = await fetch('/api/process-pdf', {
+        method: 'POST',
+        body: formData,
+      });
+
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Erro desconhecido do servidor.");
+
+      processApiResponse(result);
+
+    } catch (err) {
+      console.error("Falha ao buscar PDF recente:", err);
       setError(err.message);
     } finally {
       setLoading(false);
@@ -70,17 +136,11 @@ export default function HomePage() {
       <div className="container">
         <h1>Relatório de Dimensões (PDF → Gráficos com IA)</h1>
         <div className="row">
-           <PdfSelector 
-            onFileSelected={handleFileSelected} 
-            disabled={loading}
-          />
-          <div className="card">
-            <h3>Bem-vindo!</h3>
-            <p>Selecione um arquivo PDF para que a IA do Gemini extraia as métricas e gere os relatórios.</p>
-            {loading && <p>Analisando PDF com a IA... Isso pode levar alguns segundos.</p>}
-            {error && <p className="error">{error}</p>}
-          </div>
+           <PdfSelector onFileSelected={handleFileSelected} disabled={loading} />
+           <RecentFiles files={recentFiles} onSelect={handleRecentFileClick} disabled={loading} />
         </div>
+        {loading && <div className="card">Analisando... Isso pode levar alguns segundos.</div>}
+        {error && <div className="card error">{error}</div>}
       </div>
     );
   }
@@ -91,7 +151,6 @@ export default function HomePage() {
       <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
         <h1>Relatório de Dimensões</h1>
         <div>
-          {/* Mostra a etiqueta de cache se os dados vieram de lá */}
           {fromCache && (
             <span style={{marginRight: '15px', background: '#e0f2fe', color: '#0ea5e9', padding: '5px 10px', borderRadius: '15px', fontSize: '12px', fontWeight: 'bold'}}>
               Cache
