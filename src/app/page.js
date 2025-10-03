@@ -9,17 +9,19 @@ import Filters from "@/components/Filters";
 import { DimensionsBar, ItemsBar } from "@/components/Charts";
 import DataTable from "@/components/DataTable";
 
+// >>> IMPORTANTE: usar upload() do cliente
+import { upload } from "@vercel/blob/client";
+
 export default function HomePage() {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(false);
-  const [loadingMessage, setLoadingMessage] = useState(""); // Novo estado para mensagens de status
+  const [loadingMessage, setLoadingMessage] = useState("");
   const [error, setError] = useState("");
   const [selectedDim, setSelectedDim] = useState(null);
   const [q, setQ] = useState("");
   const [fromCache, setFromCache] = useState(false);
   const [recentFiles, setRecentFiles] = useState([]);
 
-  // Efeito para carregar a lista de arquivos recentes do localStorage na inicialização
   useEffect(() => {
     try {
       const cachedFiles = localStorage.getItem('recentPdfs');
@@ -32,7 +34,6 @@ export default function HomePage() {
     }
   }, []);
 
-  // Função para salvar um arquivo na lista de recentes
   const saveRecentFile = (fileName, hash) => {
     const newFile = { fileName, hash, timestamp: new Date().toISOString() };
     setRecentFiles(currentFiles => {
@@ -42,7 +43,6 @@ export default function HomePage() {
     });
   };
 
-  // Função central para processar a resposta da API
   const processApiResponse = (result) => {
     if (!result.rows) throw new Error("Resposta da API em formato inesperado.");
     setRows(result.rows);
@@ -51,45 +51,34 @@ export default function HomePage() {
     if (result.rows.length === 0) setError("A IA não conseguiu extrair dados estruturados do PDF.");
   };
 
-  // Lida com o envio de um NOVO arquivo usando o Vercel Blob
+  // >>> NOVO FLUXO: Upload direto do cliente com token gerado pela rota
   const handleFileSelected = useCallback(async (file) => {
     if (!file) return;
 
     setLoading(true);
     setError("");
     setFromCache(false);
-    
-    try {
-      // ETAPA 1: Pedir a URL de upload para a nossa API
-      setLoadingMessage("Preparando upload seguro...");
-      const uploadUrlResponse = await fetch('/api/upload-blob', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filename: file.name }),
-      });
-      const newBlob = await uploadUrlResponse.json();
-      if (!uploadUrlResponse.ok) throw new Error(newBlob.error || 'Falha ao preparar o upload.');
 
-      // ETAPA 2: Fazer o upload do arquivo diretamente para a URL do Vercel Blob
-      setLoadingMessage("Enviando arquivo (pode demorar para PDFs grandes)...");
-      const uploadToBlobResult = await fetch(newBlob.url, {
-        method: 'PUT',
-        body: file,
-        headers: { 'Content-Type': 'application/pdf' },
+    try {
+      // ETAPA 1: Enviar o arquivo direto para o Blob (client-side)
+      setLoadingMessage("Enviando arquivo com token seguro...");
+      const { url: blobUrl /*, pathname, size, uploadedAt */ } = await upload(file.name, file, {
+        access: 'public',                      // ou 'private'
+        handleUploadUrl: '/api/upload-blob',   // a rota acima
+        // clientPayload: 'qualquer-string-opcional',
+        // contentType: 'application/pdf', // inferido automaticamente
       });
-      if (!uploadToBlobResult.ok) throw new Error('Falha ao enviar o arquivo para o armazenamento.');
-      
-      // ETAPA 3: Enviar a URL do Blob para nossa API principal para processamento
+
+      // ETAPA 2: Processar o PDF no seu backend usando a URL do Blob
       setLoadingMessage("Analisando PDF com a IA...");
       const processResponse = await fetch('/api/process-pdf', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ blobUrl: newBlob.url, fileName: file.name }),
+        body: JSON.stringify({ blobUrl, fileName: file.name }),
       });
-      
+
       const result = await processResponse.json();
       if (!processResponse.ok) throw new Error(result.error || "Erro na análise do PDF.");
-      
       processApiResponse(result);
 
     } catch (err) {
@@ -101,7 +90,6 @@ export default function HomePage() {
     }
   }, []);
 
-  // Lida com o clique em um arquivo RECENTE
   const handleRecentFileClick = useCallback(async (hash, fileName) => {
     setLoading(true);
     setLoadingMessage("Buscando dados do cache...");
@@ -112,7 +100,7 @@ export default function HomePage() {
       const response = await fetch('/api/process-pdf', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ hash, fileName }), // Envia como JSON
+        body: JSON.stringify({ hash, fileName }),
       });
 
       const result = await response.json();
@@ -129,7 +117,6 @@ export default function HomePage() {
     }
   }, []);
 
-  // Função para limpar a tela
   const handleStartNew = () => {
     setRows([]);
     setError("");
@@ -138,7 +125,6 @@ export default function HomePage() {
     setFromCache(false);
   };
 
-  // Tela inicial
   if (rows.length === 0) {
     return (
       <div className="container">
@@ -153,7 +139,6 @@ export default function HomePage() {
     );
   }
 
-  // Tela principal com os dados
   return (
     <div className="container">
       <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>

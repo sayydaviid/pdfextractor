@@ -2,125 +2,226 @@
 
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { NextResponse } from "next/server";
-import { kv } from "@vercel/kv";
 import { createHash } from "crypto";
+import Redis from "ioredis";
+
+export const runtime = "nodejs";
+
+// ---------- Redis client (com fallback em memória) ----------
+function buildRedis() {
+  try {
+    if (process.env.REDIS_URL) {
+      return new Redis(process.env.REDIS_URL, {
+        maxRetriesPerRequest: 2,
+        enableReadyCheck: true,
+        lazyConnect: true,
+      });
+    }
+    if (process.env.REDIS_HOST && process.env.REDIS_PORT) {
+      return new Redis({
+        host: process.env.REDIS_HOST,
+        port: Number(process.env.REDIS_PORT),
+        password: process.env.REDIS_PASSWORD || undefined,
+        maxRetriesPerRequest: 2,
+        enableReadyCheck: true,
+        lazyConnect: true,
+      });
+    }
+  } catch (e) {
+    console.warn("[process-pdf] Não foi possível criar o cliente Redis:", e?.message);
+  }
+  return null;
+}
+
+// singleton simples em dev
+if (!globalThis.__REDIS__) {
+  globalThis.__REDIS__ = buildRedis();
+}
+const redis = globalThis.__REDIS__;
+
+if (!globalThis.__DEV_CACHE__) globalThis.__DEV_CACHE__ = new Map();
+const mem = globalThis.__DEV_CACHE__;
+
+async function cacheGet(key) {
+  if (redis) {
+    try {
+      if (!redis.status || redis.status === "end") await redis.connect();
+      const val = await redis.get(key);
+      return val ? JSON.parse(val) : null;
+    } catch (e) {
+      console.warn("[process-pdf] Falha ao ler do Redis:", e?.message);
+    }
+  }
+  return mem.get(key) ?? null;
+}
+
+async function cacheSet(key, value, { ex } = {}) {
+  if (redis) {
+    try {
+      if (!redis.status || redis.status === "end") await redis.connect();
+      if (ex && ex > 0) {
+        await redis.set(key, JSON.stringify(value), "EX", ex);
+      } else {
+        await redis.set(key, JSON.stringify(value));
+      }
+      return;
+    } catch (e) {
+      console.warn("[process-pdf] Falha ao gravar no Redis:", e?.message);
+    }
+  }
+  mem.set(key, value);
+  if (ex && ex > 0) {
+    setTimeout(() => mem.delete(key), ex * 1000).unref?.();
+  }
+}
+
+// ---------- Util: extrair apenas o array JSON da saída LLM ----------
+function extractJSONArray(s) {
+  let text = String(s).trim();
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced) text = fenced[1].trim();
+  const first = text.indexOf("[");
+  const last = text.lastIndexOf("]");
+  if (first !== -1 && last !== -1 && last > first) {
+    text = text.slice(first, last + 1);
+  }
+  return text.replace(/,\s*}/g, "}").replace(/,\s*]/g, "]");
+}
 
 export async function POST(request) {
   try {
-    // 1. Recebe a URL do arquivo que foi salvo no Vercel Blob.
-    const body = await request.json();
-    const blobUrl = body.blobUrl;
-    // Opcional: recebe o hash se foi um clique em "arquivo recente"
-    const hash = body.hash; 
-    let fileName = body.fileName || (blobUrl ? blobUrl.split('/').pop() : 'arquivo');
+    const { blobUrl, fileName: rawFileName, hash: incomingHash } = await request.json();
+    const fileName = rawFileName || (blobUrl ? blobUrl.split("/").pop() : "arquivo");
 
-    let fileHash = hash;
+    let fileHash = incomingHash ?? null;
     let buffer;
 
-    // Se tivermos uma URL, significa que é um novo upload
+    // Upload novo → baixa do Blob e calcula hash
     if (blobUrl) {
-      console.log(`[LOG] Processando arquivo da URL: ${blobUrl}`);
-
-      // 2. Baixa o arquivo da URL para a memória (buffer)
-      const response = await fetch(blobUrl);
-      if (!response.ok) {
-        throw new Error(`Falha ao baixar o arquivo do Blob: ${response.statusText}`);
-      }
-      const blobData = await response.arrayBuffer();
-      buffer = Buffer.from(blobData);
-      
-      // Calcula o hash do arquivo baixado
-      fileHash = createHash('sha265').update(buffer).digest('hex');
+      console.log(`[process-pdf] Baixando do Blob: ${blobUrl}`);
+      const resp = await fetch(blobUrl);
+      if (!resp.ok) throw new Error(`Falha ao baixar o Blob: ${resp.status} ${resp.statusText}`);
+      const ab = await resp.arrayBuffer();
+      buffer = Buffer.from(ab);
+      fileHash = createHash("sha256").update(buffer).digest("hex"); // ✅ sha256
     }
 
     if (!fileHash) {
-       return NextResponse.json({ error: "Nenhum arquivo ou hash foi enviado." }, { status: 400 });
+      return NextResponse.json(
+        { error: "Nenhum arquivo ou hash foi enviado." },
+        { status: 400 }
+      );
     }
 
-    console.log(`[LOG] Hash do arquivo: ${fileHash}`);
-    
-    // 3. Verifica o cache no Vercel KV com o hash
-    const cachedResult = await kv.get(fileHash);
+    console.log(`[process-pdf] Hash: ${fileHash}`);
 
-    if (cachedResult) {
-      console.log("CACHE HIT! Retornando dados salvos.");
-      return NextResponse.json({ rows: cachedResult, fromCache: true, hash: fileHash, fileName: fileName });
+    // ---------- CACHE ----------
+    const cached = await cacheGet(fileHash);
+    if (cached) {
+      console.log("[process-pdf] CACHE HIT");
+      return NextResponse.json({
+        rows: cached,
+        fromCache: true,
+        hash: fileHash,
+        fileName,
+      });
     }
 
-    // Se chegou aqui, é CACHE MISS. Se não tivermos o buffer (veio de um clique em 'recente' com cache expirado), dá erro.
     if (!buffer) {
-       return NextResponse.json({ error: "Cache não encontrado para este arquivo. Por favor, faça o upload novamente." }, { status: 404 });
+      // clicou em "recente" mas o cache expirou e não temos o arquivo
+      return NextResponse.json(
+        { error: "Cache não encontrado para este arquivo. Por favor, faça o upload novamente." },
+        { status: 404 }
+      );
     }
-    
-    console.log("CACHE MISS! Chamando a API do Gemini.");
-    
-    // O resto da lógica do Gemini continua a mesma
+
+    console.log("[process-pdf] CACHE MISS — chamando Gemini");
+
+    // ---------- Gemini ----------
+    if (!process.env.GOOGLE_API_KEY) {
+      throw new Error("GOOGLE_API_KEY não configurada no ambiente.");
+    }
+
     const filePart = {
-      inlineData: { data: buffer.toString("base64"), mimeType: 'application/pdf' }
+      inlineData: {
+        data: buffer.toString("base64"),
+        mimeType: "application/pdf",
+      },
     };
+
+    const prompt = `
+Analise o documento PDF fornecido, que é um relatório de avaliação.
+O nome do arquivo original é: ${fileName}.
+Sua tarefa é extrair os dados estruturados de dimensões e itens.
+
+Instruções de parsing:
+- Linhas que começam com "Dimensão X:" definem uma nova seção.
+  * Extraia: número da dimensão (X), TÍTULO COMPLETO da dimensão, e a nota média (dimension_mean).
+- As linhas seguintes contêm itens com códigos como "1.1.".
+  * Para cada item: extraia o código (item_code), o texto descritivo completo (item_text) e a nota (item_score).
+- Para as linhas de "Dimensão", os campos de item devem ser null.
+
+Retorne EXCLUSIVAMENTE um ARRAY JSON válido, sem comentários, sem markdown, sem texto fora do JSON.
+Cada objeto deve seguir exatamente esta estrutura:
+{
+  "pdf": "${fileName}",
+  "dimension_number": 1,
+  "dimension_title": "TÍTULO DA DIMENSÃO",
+  "dimension_mean": 4.5,
+  "item_code": "1.1",
+  "item_text": "TEXTO DO ITEM.",
+  "item_score": 5.0
+}
+`;
 
     const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
 
-    const prompt = `
-      Analise o documento PDF fornecido, que é um relatório de avaliação.
-      O nome do arquivo original é: ${fileName}.
-      Sua tarefa é extrair os dados estruturados de dimensões e itens.
-      O formato é:
-      - Linhas que começam com "Dimensão X:" definem uma nova seção. Extraia o número da dimensão, o título completo e a nota média.
-      - As linhas seguintes contêm itens, identificados por códigos numéricos como "1.1.". Para cada item, extraia o código, o texto descritivo completo e a nota.
-      Retorne o resultado EXCLUSIVAMENTE como um array de objetos JSON válido.
-      A estrutura de cada objeto deve ser:
-      {
-        "pdf": "${fileName}",
-        "dimension_number": 1,
-        "dimension_title": "TÍTULO DA DIMENSÃO",
-        "dimension_mean": 4.5,
-        "item_code": "1.1",
-        "item_text": "TEXTO DO ITEM.",
-        "item_score": 5.0
-      }
-      Para as linhas de Dimensão, os campos de item devem ser 'null'.
-    `;
-
     const maxRetries = 3;
     let delay = 2000;
 
-    for (let i = 0; i < maxRetries; i++) {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
         const result = await model.generateContent([prompt, filePart]);
-        const geminiResponse = await result.response;
-        const text = geminiResponse.text();
+        const resp = await result.response;
+        const rawText = resp.text() ?? "";
 
-        let cleanedText = text.trim();
-        if (cleanedText.startsWith("```json")) cleanedText = cleaned_text.substring(7);
-        if (cleanedText.endsWith("```")) cleanedText = cleaned_text.substring(0, cleaned_text.length - 3);
+        const jsonText = extractJSONArray(rawText);
+        const data = JSON.parse(jsonText);
+        if (!Array.isArray(data)) throw new Error("A resposta do modelo não é um array JSON.");
 
-        const data = JSON.parse(cleanedText);
-        
-        const twoDaysInSeconds = 2 * 24 * 60 * 60;
-        await kv.set(fileHash, data, { ex: twoDaysInSeconds });
-        console.log(`Resultado salvo no cache por 2 dias.`);
-        
-        return NextResponse.json({ rows: data, fromCache: false, hash: fileHash, fileName: fileName });
-      
-      } catch (error) {
-        if (error.status === 503 && i < maxRetries - 1) {
-          console.warn(`API sobrecarregada, tentando novamente...`);
-          await new Promise(resolve => setTimeout(resolve, delay));
-          delay *= 2; 
-        } else {
-          throw error;
+        // grava cache (2 dias)
+        await cacheSet(fileHash, data, { ex: 2 * 24 * 60 * 60 });
+        console.log("[process-pdf] Resultado cacheado por 2 dias.", redis ? "(Redis)" : "(memória)");
+
+        return NextResponse.json({
+          rows: data,
+          fromCache: false,
+          hash: fileHash,
+          fileName,
+        });
+      } catch (err) {
+        const status = err?.status ?? err?.response?.status;
+        const isOverloaded = status === 503;
+        if (isOverloaded && attempt < maxRetries - 1) {
+          console.warn(`[process-pdf] 503 do Gemini, retry em ${delay}ms...`);
+          await new Promise((r) => setTimeout(r, delay));
+          delay *= 2;
+          continue;
         }
+        throw err;
       }
     }
-
   } catch (error) {
     console.error("Erro na API Route do Gemini:", error);
-    const errorMessage = error.status === 503 
-      ? "A API do Google está sobrecarregada. Tente novamente mais tarde."
-      : "Falha ao processar o PDF com a IA.";
-      
+    const status = error?.status ?? error?.response?.status;
+    const errorMessage =
+      status === 503
+        ? "A API do Google está sobrecarregada. Tente novamente mais tarde."
+        : (error?.message?.includes("GOOGLE_API_KEY")
+            ? "GOOGLE_API_KEY não configurada no ambiente."
+            : "Falha ao processar o PDF com a IA.");
+
     return NextResponse.json({ error: errorMessage }, { status: 500 });
   }
 }

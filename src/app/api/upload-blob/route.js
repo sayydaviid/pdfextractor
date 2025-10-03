@@ -1,24 +1,46 @@
 // src/app/api/upload-blob/route.js
-import { put } from '@vercel/blob';
+import { handleUpload } from '@vercel/blob/client';
 import { NextResponse } from 'next/server';
 
+// Garante acesso a process.env
+export const runtime = 'nodejs';
+
 export async function POST(request) {
-  // Pega o nome do arquivo do corpo da requisição JSON
-  const { filename } = await request.json();
+  const body = await request.json();
 
   try {
-    // A correção é aqui: removemos o 'request.body' da chamada.
-    // Estamos apenas pedindo para a Vercel gerar uma URL para um arquivo com este nome.
-    // O conteúdo do arquivo será enviado pelo navegador do usuário depois.
-    const blob = await put(filename, {
-      access: 'public',
+    const json = await handleUpload({
+      request,
+      body,
+      // Usa o token no server (necessário em dev)
+      token: process.env.BLOB_READ_WRITE_TOKEN,
+
+      onBeforeGenerateToken: async () => {
+        return {
+          access: 'public',                // ou 'private'
+          addRandomSuffix: true,
+          allowedContentTypes: [
+            'application/pdf',
+            'image/*',
+            'text/*',
+          ],
+          // maximumSizeInBytes: 50 * 1024 * 1024,
+          // validUntil: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+        };
+      },
+
+      onUploadCompleted: async ({ blob }) => {
+        console.log('Upload concluído no Blob:', blob.url);
+        // Persistir no banco se quiser
+      },
     });
 
-    // Retorna os dados do blob (incluindo a URL de upload) para o cliente
-    return NextResponse.json(blob);
-    
-  } catch (error) {
-    console.error("Erro ao gerar URL de upload:", error);
-    return NextResponse.json({ error: 'Falha ao preparar o upload para o Blob.' }, { status: 500 });
+    return NextResponse.json(json);
+  } catch (err) {
+    console.error('Erro no handleUpload:', err);
+    return NextResponse.json(
+      { error: err?.message ?? 'Erro no upload' },
+      { status: 400 }
+    );
   }
 }
