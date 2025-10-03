@@ -5,110 +5,108 @@ import { NextResponse } from "next/server";
 import { kv } from "@vercel/kv";
 import { createHash } from "crypto";
 
-// Função para converter o stream do arquivo em um buffer
-async function streamToBuffer(stream) {
-  const chunks = [];
-  for await (const chunk of stream) {
-    chunks.push(chunk);
-  }
-  return Buffer.concat(chunks);
-}
-
 export async function POST(request) {
   try {
-    // 1. Recebe o arquivo enviado pelo frontend
-    const formData = await request.formData();
-    const file = formData.get("file");
+    // 1. Recebe a URL do arquivo que foi salvo no Vercel Blob.
+    const body = await request.json();
+    const blobUrl = body.blobUrl;
+    // Opcional: recebe o hash se foi um clique em "arquivo recente"
+    const hash = body.hash; 
+    let fileName = body.fileName || (blobUrl ? blobUrl.split('/').pop() : 'arquivo');
 
-    if (!file) {
-      return NextResponse.json({ error: "Nenhum arquivo enviado." }, { status: 400 });
+    let fileHash = hash;
+    let buffer;
+
+    // Se tivermos uma URL, significa que é um novo upload
+    if (blobUrl) {
+      console.log(`[LOG] Processando arquivo da URL: ${blobUrl}`);
+
+      // 2. Baixa o arquivo da URL para a memória (buffer)
+      const response = await fetch(blobUrl);
+      if (!response.ok) {
+        throw new Error(`Falha ao baixar o arquivo do Blob: ${response.statusText}`);
+      }
+      const blobData = await response.arrayBuffer();
+      buffer = Buffer.from(blobData);
+      
+      // Calcula o hash do arquivo baixado
+      fileHash = createHash('sha265').update(buffer).digest('hex');
     }
 
-    const buffer = await streamToBuffer(file.stream());
+    if (!fileHash) {
+       return NextResponse.json({ error: "Nenhum arquivo ou hash foi enviado." }, { status: 400 });
+    }
 
-    // --- LÓGICA DE CACHE ADICIONADA ---
-    // Calcula um hash único para o conteúdo do arquivo
-    const fileHash = createHash('sha256').update(buffer).digest('hex');
-    console.log(`Hash do arquivo: ${fileHash}`);
-
-    // Verifica se o resultado já existe no Vercel KV
+    console.log(`[LOG] Hash do arquivo: ${fileHash}`);
+    
+    // 3. Verifica o cache no Vercel KV com o hash
     const cachedResult = await kv.get(fileHash);
+
     if (cachedResult) {
       console.log("CACHE HIT! Retornando dados salvos.");
-      return NextResponse.json({ rows: cachedResult, fromCache: true, hash: fileHash, fileName: file.name });
+      return NextResponse.json({ rows: cachedResult, fromCache: true, hash: fileHash, fileName: fileName });
     }
+
+    // Se chegou aqui, é CACHE MISS. Se não tivermos o buffer (veio de um clique em 'recente' com cache expirado), dá erro.
+    if (!buffer) {
+       return NextResponse.json({ error: "Cache não encontrado para este arquivo. Por favor, faça o upload novamente." }, { status: 404 });
+    }
+    
     console.log("CACHE MISS! Chamando a API do Gemini.");
-    // --- FIM DA LÓGICA DE CACHE ---
-
-
-    // Converte o arquivo para o formato que a API do Gemini entende
+    
+    // O resto da lógica do Gemini continua a mesma
     const filePart = {
-      inlineData: {
-        data: buffer.toString("base64"),
-        mimeType: file.type,
-      },
+      inlineData: { data: buffer.toString("base64"), mimeType: 'application/pdf' }
     };
 
     const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
-    
-    // Corrigido para o nome de modelo válido e mais poderoso que sabemos que funciona
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
 
     const prompt = `
       Analise o documento PDF fornecido, que é um relatório de avaliação.
+      O nome do arquivo original é: ${fileName}.
       Sua tarefa é extrair os dados estruturados de dimensões e itens.
       O formato é:
-      - Linhas que começam com "Dimensão X:" definem uma nova seção. Extraia o número da dimensão, o título completo e a nota média que aparece no final da linha.
-      - As linhas seguintes contêm itens, identificados por códigos numéricos como "1.1.", "2.5.", "3.12.". Para cada item, extraia o código, o texto descritivo completo e a nota no final da linha.
-      - Ignore qualquer outro texto introdutório, cabeçalhos, rodapés ou informações que não se encaixem neste formato.
-      - O nome do arquivo original é: ${file.name}.
-
-      Retorne o resultado EXCLUSIVAMENTE como um array de objetos JSON válido, sem nenhum texto, comentários ou formatação extra (como \`\`\`json).
-      A estrutura de cada objeto no array deve ser:
+      - Linhas que começam com "Dimensão X:" definem uma nova seção. Extraia o número da dimensão, o título completo e a nota média.
+      - As linhas seguintes contêm itens, identificados por códigos numéricos como "1.1.". Para cada item, extraia o código, o texto descritivo completo e a nota.
+      Retorne o resultado EXCLUSIVAMENTE como um array de objetos JSON válido.
+      A estrutura de cada objeto deve ser:
       {
-        "pdf": "${file.name}",
+        "pdf": "${fileName}",
         "dimension_number": 1,
-        "dimension_title": "O TÍTULO DA DIMENSÃO",
+        "dimension_title": "TÍTULO DA DIMENSÃO",
         "dimension_mean": 4.5,
         "item_code": "1.1",
-        "item_text": "O TEXTO COMPLETO DO ITEM.",
+        "item_text": "TEXTO DO ITEM.",
         "item_score": 5.0
       }
-      Para as linhas que representam a Dimensão em si, os campos "item_code", "item_text" e "item_score" devem ser 'null'.
+      Para as linhas de Dimensão, os campos de item devem ser 'null'.
     `;
 
-    // --- Início da Lógica de Retentativa (Retry) Adicionada ---
     const maxRetries = 3;
     let delay = 2000;
 
     for (let i = 0; i < maxRetries; i++) {
       try {
-        console.log(`Tentativa ${i + 1} de chamar a API do Gemini...`);
         const result = await model.generateContent([prompt, filePart]);
-        const response = await result.response;
-        const text = response.text();
+        const geminiResponse = await result.response;
+        const text = geminiResponse.text();
 
         let cleanedText = text.trim();
-        if (cleanedText.startsWith("```json")) {
-          cleanedText = cleanedText.substring(7);
-        }
-        if (cleanedText.endsWith("```")) {
-          cleanedText = cleanedText.substring(0, cleanedText.length - 3);
-        }
+        if (cleanedText.startsWith("```json")) cleanedText = cleaned_text.substring(7);
+        if (cleanedText.endsWith("```")) cleanedText = cleaned_text.substring(0, cleaned_text.length - 3);
 
         const data = JSON.parse(cleanedText);
         
-        // --- ADICIONADO: Salvando o novo resultado no cache ---
         const twoDaysInSeconds = 2 * 24 * 60 * 60;
         await kv.set(fileHash, data, { ex: twoDaysInSeconds });
-        console.log(`Resultado salvo no cache por 2 dias. Chave: ${fileHash}`);
-
-        console.log("Sucesso na chamada da API!");
-        return NextResponse.json({ rows: data, fromCache: false, hash: fileHash, fileName: file.name });
+        console.log(`Resultado salvo no cache por 2 dias.`);
+        
+        return NextResponse.json({ rows: data, fromCache: false, hash: fileHash, fileName: fileName });
       
       } catch (error) {
         if (error.status === 503 && i < maxRetries - 1) {
-          console.warn(`API sobrecarregada (503). Tentativa ${i + 1} falhou. Tentando novamente em ${delay / 1000}s...`);
+          console.warn(`API sobrecarregada, tentando novamente...`);
           await new Promise(resolve => setTimeout(resolve, delay));
           delay *= 2; 
         } else {
@@ -116,12 +114,11 @@ export async function POST(request) {
         }
       }
     }
-    // --- Fim da Lógica de Retentativa ---
 
   } catch (error) {
-    console.error("Erro na API Route do Gemini após todas as tentativas:", error);
+    console.error("Erro na API Route do Gemini:", error);
     const errorMessage = error.status === 503 
-      ? "A API do Google está sobrecarregada no momento. Por favor, tente novamente mais tarde."
+      ? "A API do Google está sobrecarregada. Tente novamente mais tarde."
       : "Falha ao processar o PDF com a IA.";
       
     return NextResponse.json({ error: errorMessage }, { status: 500 });

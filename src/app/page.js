@@ -4,7 +4,7 @@
 import "./globals.css";
 import { useState, useCallback, useEffect } from "react";
 import PdfSelector from "@/components/PdfSelector";
-import RecentFiles from "@/components/RecentFiles"; // Importa o novo componente
+import RecentFiles from "@/components/RecentFiles";
 import Filters from "@/components/Filters";
 import { DimensionsBar, ItemsBar } from "@/components/Charts";
 import DataTable from "@/components/DataTable";
@@ -12,11 +12,12 @@ import DataTable from "@/components/DataTable";
 export default function HomePage() {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [loadingMessage, setLoadingMessage] = useState(""); // Novo estado para mensagens de status
   const [error, setError] = useState("");
   const [selectedDim, setSelectedDim] = useState(null);
   const [q, setQ] = useState("");
   const [fromCache, setFromCache] = useState(false);
-  const [recentFiles, setRecentFiles] = useState([]); // Novo estado para arquivos recentes
+  const [recentFiles, setRecentFiles] = useState([]);
 
   // Efeito para carregar a lista de arquivos recentes do localStorage na inicialização
   useEffect(() => {
@@ -31,11 +32,9 @@ export default function HomePage() {
     }
   }, []);
 
-  // Função para salvar um arquivo na lista de recentes (no estado e no localStorage)
+  // Função para salvar um arquivo na lista de recentes
   const saveRecentFile = (fileName, hash) => {
     const newFile = { fileName, hash, timestamp: new Date().toISOString() };
-    
-    // Atualiza a lista, evitando duplicados e mantendo os 5 mais recentes
     setRecentFiles(currentFiles => {
       const updatedFiles = [newFile, ...currentFiles.filter(f => f.hash !== hash)].slice(0, 5);
       localStorage.setItem('recentPdfs', JSON.stringify(updatedFiles));
@@ -45,23 +44,14 @@ export default function HomePage() {
 
   // Função central para processar a resposta da API
   const processApiResponse = (result) => {
-    if (!result.rows) {
-      throw new Error("Resposta da API em formato inesperado.");
-    }
-    console.log("Análise concluída. Dados encontrados:", result.rows);
+    if (!result.rows) throw new Error("Resposta da API em formato inesperado.");
     setRows(result.rows);
     setFromCache(result.fromCache || false);
-
-    if (result.hash && result.fileName) {
-      saveRecentFile(result.fileName, result.hash);
-    }
-
-    if (result.rows.length === 0) {
-      setError("A IA não conseguiu extrair dados estruturados do PDF.");
-    }
+    if (result.hash && result.fileName) saveRecentFile(result.fileName, result.hash);
+    if (result.rows.length === 0) setError("A IA não conseguiu extrair dados estruturados do PDF.");
   };
 
-  // Lida com o envio de um NOVO arquivo
+  // Lida com o envio de um NOVO arquivo usando o Vercel Blob
   const handleFileSelected = useCallback(async (file) => {
     if (!file) return;
 
@@ -70,41 +60,59 @@ export default function HomePage() {
     setFromCache(false);
     
     try {
-      const formData = new FormData();
-      formData.append("file", file);
-
-      const response = await fetch('/api/process-pdf', {
+      // ETAPA 1: Pedir a URL de upload para a nossa API
+      setLoadingMessage("Preparando upload seguro...");
+      const uploadUrlResponse = await fetch('/api/upload-blob', {
         method: 'POST',
-        body: formData,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: file.name }),
       });
+      const newBlob = await uploadUrlResponse.json();
+      if (!uploadUrlResponse.ok) throw new Error(newBlob.error || 'Falha ao preparar o upload.');
 
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.error || "Erro desconhecido do servidor.");
+      // ETAPA 2: Fazer o upload do arquivo diretamente para a URL do Vercel Blob
+      setLoadingMessage("Enviando arquivo (pode demorar para PDFs grandes)...");
+      const uploadToBlobResult = await fetch(newBlob.url, {
+        method: 'PUT',
+        body: file,
+        headers: { 'Content-Type': 'application/pdf' },
+      });
+      if (!uploadToBlobResult.ok) throw new Error('Falha ao enviar o arquivo para o armazenamento.');
+      
+      // ETAPA 3: Enviar a URL do Blob para nossa API principal para processamento
+      setLoadingMessage("Analisando PDF com a IA...");
+      const processResponse = await fetch('/api/process-pdf', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ blobUrl: newBlob.url, fileName: file.name }),
+      });
+      
+      const result = await processResponse.json();
+      if (!processResponse.ok) throw new Error(result.error || "Erro na análise do PDF.");
       
       processApiResponse(result);
 
     } catch (err) {
-      console.error("Falha ao enviar PDF para a API:", err);
+      console.error("Falha no processo:", err);
       setError(err.message);
     } finally {
       setLoading(false);
+      setLoadingMessage("");
     }
-  }, []); // Dependências vazias para evitar recriação desnecessária
+  }, []);
 
   // Lida com o clique em um arquivo RECENTE
   const handleRecentFileClick = useCallback(async (hash, fileName) => {
     setLoading(true);
+    setLoadingMessage("Buscando dados do cache...");
     setError("");
     setFromCache(false);
 
     try {
-      const formData = new FormData();
-      formData.append("hash", hash);
-      formData.append("fileName", fileName);
-
       const response = await fetch('/api/process-pdf', {
         method: 'POST',
-        body: formData,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hash, fileName }), // Envia como JSON
       });
 
       const result = await response.json();
@@ -117,20 +125,20 @@ export default function HomePage() {
       setError(err.message);
     } finally {
       setLoading(false);
+      setLoadingMessage("");
     }
   }, []);
 
-  // Função para limpar a tela e permitir uma nova análise
+  // Função para limpar a tela
   const handleStartNew = () => {
     setRows([]);
     setError("");
     setSelectedDim(null);
     setQ("");
     setFromCache(false);
-    console.log("Dados da tela limpos para nova análise.");
   };
 
-  // Tela inicial quando não há dados carregados
+  // Tela inicial
   if (rows.length === 0) {
     return (
       <div className="container">
@@ -139,13 +147,13 @@ export default function HomePage() {
            <PdfSelector onFileSelected={handleFileSelected} disabled={loading} />
            <RecentFiles files={recentFiles} onSelect={handleRecentFileClick} disabled={loading} />
         </div>
-        {loading && <div className="card">Analisando... Isso pode levar alguns segundos.</div>}
+        {loading && <div className="card">{loadingMessage}</div>}
         {error && <div className="card error">{error}</div>}
       </div>
     );
   }
 
-  // Tela principal com os dados e gráficos
+  // Tela principal com os dados
   return (
     <div className="container">
       <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
